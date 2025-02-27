@@ -236,7 +236,7 @@ def smooth_uncertainty_with_rag(uncertainty, rag, superpixel_labels, lambda_=0.5
 
     return smoothed_uncertainty
 
-def adjust_posterior_with_entropy(P, H_opt, lambda_=1.0, epsilon=0.1):
+def adjust_posterior_with_entropy(P, H_opt, lambda_=1, epsilon=0.1):
     """
     根据调整后的熵 H_opt 重新调整类别后验概率 P。
 
@@ -414,32 +414,23 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
             cluster_gts.unsqueeze(0),size=(image_size,image_size),mode='bilinear',align_corners=False
         )[0] # n,H,W
 
-        # 基于rag的边的权重，certainty map，去修正模型预测结果的不确定性，再温度修正预测后验概率
+        # edges的权重构建的图，用这个图作为温度缩放类别预测后验概率
         #############################
         rag, superpixel_labels = build_color_rag(np.array(ori_images), n_segments=1000, compactness=10)
-        p_ = cluster_gts.softmax(dim=0)
-        uncertainty = -torch.sum(p_ * torch.log(p_), dim=0)
-
-        # smoothed_uncertainty = smooth_uncertainty_with_rag(uncertainty.detach().cpu().numpy(), rag, superpixel_labels, lambda_=0.5, iterations=1)
-        # cluster_gts = adjust_posterior_with_entropy(p_.detach().cpu().numpy(), smoothed_uncertainty, lambda_=1, epsilon=0.1)
-        # cluster_gts = torch.as_tensor(cluster_gts).to("cuda")
-
         superpixel_weights = compute_superpixel_weights(rag, superpixel_labels)
         max_weight = np.max(list(superpixel_weights.values()))
         min_weight = np.min(list(superpixel_weights.values()))
         
         norm_weights = {sp: (superpixel_weights[sp] - min_weight) / (max_weight - min_weight) for sp in superpixel_weights}
         
-        edge_seg = np.zeros(uncertainty.shape, dtype=np.float32)
+        edge_seg = np.zeros(superpixel_labels.shape, dtype=np.float32)
         for patch_id in range(len(np.unique(superpixel_labels))):
             mask = (superpixel_labels == patch_id)
             edge_seg[mask] = norm_weights[patch_id]
-
-        uncertainty_weighted = uncertainty + uncertainty * torch.tensor(edge_seg).to("cuda")
-
-        cluster_gts = adjust_posterior_with_entropy(p_.detach().cpu().numpy(), uncertainty_weighted.detach().cpu().numpy(), lambda_=1, epsilon=0.1)
-        cluster_gts = torch.as_tensor(cluster_gts).to("cuda")        
-
+        
+        edge_seg = torch.as_tensor(edge_seg).to("cuda")
+        
+        cluster_gts = (cluster_gts / edge_seg).softmax(dim=0)
         
         # plt.figure()
         # plt.subplot(1,3,1)
