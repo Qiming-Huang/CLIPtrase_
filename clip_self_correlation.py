@@ -188,7 +188,7 @@ def build_feature_rag(vit_features, image_size=(224, 224), patch_size=16):
 
 def smooth_uncertainty_with_rag(uncertainty, rag, superpixel_labels, lambda_=0.5, iterations=10):
     """
-    使用超像素 RAG 进行熵的拉普拉斯平滑。
+    使用超像素 RAG 进行区域级别的拉普拉斯平滑，而不是单独平均后再平滑。
 
     参数：
     - uncertainty: (H, W) 形状的不确定性熵
@@ -200,27 +200,39 @@ def smooth_uncertainty_with_rag(uncertainty, rag, superpixel_labels, lambda_=0.5
     返回：
     - smoothed_uncertainty: (H, W) 形状，平滑后的不确定性熵
     """
+    H, W = uncertainty.shape
     unique_labels = np.unique(superpixel_labels)
     num_superpixels = len(unique_labels)
 
-    # 计算每个超像素区域的初始均值熵
-    superpixel_uncertainty = np.zeros(num_superpixels)
-    for idx, label in enumerate(unique_labels):
-        mask = (superpixel_labels == label)
-        superpixel_uncertainty[idx] = uncertainty[mask].mean().item()  # 计算该超像素内的熵均值
+    # 创建超像素区域的熵映射
+    superpixel_uncertainty = uncertainty.copy()
 
-    # 获取 RAG 的邻接矩阵
+    # 超像素内部进行局部平滑
+    for _ in range(iterations):
+        new_uncertainty = superpixel_uncertainty.copy()
+
+        for label in unique_labels:
+            mask = (superpixel_labels == label)
+
+            # 仅在超像素内部进行平滑 (使用超像素内部均值)
+            if np.any(mask):
+                new_uncertainty[mask] = (1 - lambda_) * superpixel_uncertainty[mask] + lambda_ * superpixel_uncertainty[mask].mean()
+
+        superpixel_uncertainty = new_uncertainty
+
+    # 通过 RAG 进行超像素间的平滑
     L = nx.normalized_laplacian_matrix(rag).toarray()
+    superpixel_flat = np.array([superpixel_uncertainty[superpixel_labels == label].mean() for label in unique_labels])
 
     # 迭代拉普拉斯平滑
     for _ in range(iterations):
-        superpixel_uncertainty = (1 - lambda_) * superpixel_uncertainty + lambda_ * L @ superpixel_uncertainty
+        superpixel_flat = (1 - lambda_) * superpixel_flat + lambda_ * L @ superpixel_flat
 
     # 传播回像素级别
     smoothed_uncertainty = np.zeros_like(uncertainty)
     for idx, label in enumerate(unique_labels):
         mask = (superpixel_labels == label)
-        smoothed_uncertainty[mask] = superpixel_uncertainty[idx]
+        smoothed_uncertainty[mask] = superpixel_flat[idx]
 
     return smoothed_uncertainty
 
@@ -249,6 +261,65 @@ def adjust_posterior_with_entropy(P, H_opt, lambda_=1.0, epsilon=0.1):
     P_new = P_adj / np.sum(P_adj, axis=0, keepdims=True)
 
     return P_new
+
+def compute_superpixel_weights(rag, superpixel_labels):
+    """
+    计算每个超像素区域的总边权重
+    :param rag: Region Adjacency Graph
+    :param superpixel_labels: 超像素标签图
+    :return: 每个超像素区域的总边权重
+    """
+    # 计算每个节点的边权重之和
+    node_weights = {node: sum(rag[node][nbr]['weight'] for nbr in rag.neighbors(node)) for node in rag.nodes()}
+    
+    # 计算每个超像素区域的总边权重
+    superpixel_weights = {node: node_weights[node] for node in rag.nodes()}
+    
+    return superpixel_weights
+
+def compute_superpixel_max(rag, superpixel_labels):
+    """
+    计算每个超像素区域的总边权重
+    :param rag: Region Adjacency Graph
+    :param superpixel_labels: 超像素标签图
+    :return: 每个超像素区域的总边权重
+    """
+    # 计算每个节点的边权重之和
+    node_weights = {node: max(rag[node][nbr]['weight'] for nbr in rag.neighbors(node)) for node in rag.nodes()}
+    
+    # 计算每个超像素区域的总边权重
+    superpixel_weights = {node: node_weights[node] for node in rag.nodes()}
+    
+    return superpixel_weights
+
+def visualize_superpixel_weights(image, superpixel_labels, superpixel_weights):
+    """
+    可视化超像素区域的边权重之和
+    :param image: 原始图像
+    :param superpixel_labels: 超像素标签
+    :param superpixel_weights: 每个超像素的边权重之和
+    """
+    # 归一化超像素边权重到 0-1
+    max_weight = max(superpixel_weights.values())
+    min_weight = min(superpixel_weights.values())
+    
+    norm_weights = {sp: (superpixel_weights[sp] - min_weight) / (max_weight - min_weight) for sp in superpixel_weights}
+    
+    # 生成颜色映射
+    cmap = plt.cm.viridis
+    colored_seg = np.zeros_like(image, dtype=np.float32)
+
+    for sp in np.unique(superpixel_labels):
+        mask = superpixel_labels == sp
+        color = cmap(norm_weights[sp])[:3]  # 获取 RGB 颜色
+        colored_seg[mask] = color
+    
+    # 显示图像
+    plt.figure(figsize=(10, 6))
+    plt.imshow(colored_seg)
+    plt.axis('off')
+    plt.title("Superpixel Edge Weight Sums")
+    plt.show()
 
 def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
     # text feature
@@ -343,15 +414,41 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
             cluster_gts.unsqueeze(0),size=(image_size,image_size),mode='bilinear',align_corners=False
         )[0] # n,H,W
 
-        # 基于熵的拉普拉斯平滑 后验预测概率
+        # 基于rag的边的权重，certainty map，去修正模型预测结果的不确定性，再温度修正预测后验概率
         #############################
         rag, superpixel_labels = build_color_rag(np.array(ori_images), n_segments=1000, compactness=10)
         p_ = cluster_gts.softmax(dim=0)
         uncertainty = -torch.sum(p_ * torch.log(p_), dim=0)
 
-        smoothed_uncertainty = smooth_uncertainty_with_rag(uncertainty.detach().cpu().numpy(), rag, superpixel_labels, lambda_=0.5, iterations=1)
-        cluster_gts = adjust_posterior_with_entropy(p_.detach().cpu().numpy(), smoothed_uncertainty)
-        cluster_gts = torch.as_tensor(cluster_gts).to("cuda")
+        # smoothed_uncertainty = smooth_uncertainty_with_rag(uncertainty.detach().cpu().numpy(), rag, superpixel_labels, lambda_=0.5, iterations=1)
+        # cluster_gts = adjust_posterior_with_entropy(p_.detach().cpu().numpy(), smoothed_uncertainty, lambda_=1, epsilon=0.1)
+        # cluster_gts = torch.as_tensor(cluster_gts).to("cuda")
+
+        superpixel_weights = compute_superpixel_weights(rag, superpixel_labels)
+        max_weight = np.max(list(superpixel_weights.values()))
+        min_weight = np.min(list(superpixel_weights.values()))
+        
+        norm_weights = {sp: (superpixel_weights[sp] - min_weight) / (max_weight - min_weight) for sp in superpixel_weights}
+        
+        edge_seg = np.zeros(uncertainty.shape, dtype=np.float32)
+        for patch_id in range(len(np.unique(superpixel_labels))):
+            mask = (superpixel_labels == patch_id)
+            edge_seg[mask] = norm_weights[patch_id]
+
+        uncertainty_weighted = uncertainty + uncertainty * torch.tensor(edge_seg).to("cuda")
+
+        cluster_gts = adjust_posterior_with_entropy(p_.detach().cpu().numpy(), uncertainty_weighted.detach().cpu().numpy(), lambda_=1, epsilon=0.1)
+        cluster_gts = torch.as_tensor(cluster_gts).to("cuda")        
+
+        
+        # plt.figure()
+        # plt.subplot(1,3,1)
+        # plt.imshow(uncertainty.detach().cpu().numpy(), cmap='jet')
+        # plt.subplot(1,3,2)
+        # plt.imshow((uncertainty * torch.tensor(edge_seg).to("cuda")).detach().cpu().numpy(), cmap='jet') 
+        # plt.subplot(1,3,3)
+        # plt.imshow(edge_seg, cmap='jet')
+        # plt.savefig("x.png")       
         #############################
 
         cluster_gts = cluster_gts.argmax(dim=0)
