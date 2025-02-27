@@ -422,15 +422,21 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
         min_weight = np.min(list(superpixel_weights.values()))
         
         norm_weights = {sp: (superpixel_weights[sp] - min_weight) / (max_weight - min_weight) for sp in superpixel_weights}
+
+        def compute_temperature(rag_weights, alpha=5.0):
+            return torch.exp(-alpha * rag_weights) + 1  # T > 1
+
+        temperature_map = compute_temperature(torch.as_tensor(list(norm_weights.values())))
         
-        edge_seg = np.zeros(superpixel_labels.shape, dtype=np.float32)
-        for patch_id in range(len(np.unique(superpixel_labels))):
+        edge_seg_temp = np.zeros(superpixel_labels.shape, dtype=np.float32)
+        for patch_id in range(len(np.unique(temperature_map))):
             mask = (superpixel_labels == patch_id)
-            edge_seg[mask] = norm_weights[patch_id]
+            edge_seg_temp[mask] = temperature_map[patch_id]        
         
-        edge_seg = torch.as_tensor(edge_seg).to("cuda")
+        edge_seg_temp = torch.as_tensor(edge_seg_temp).to("cuda")
         
-        cluster_gts = (cluster_gts / edge_seg).softmax(dim=0)
+        # cluster_gts = (cluster_gts / edge_seg_temp).softmax(dim=0)
+        # cluster_gts = (cluster_gts * edge_seg_temp)
         
         # plt.figure()
         # plt.subplot(1,3,1)
@@ -440,9 +446,14 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
         # plt.subplot(1,3,3)
         # plt.imshow(edge_seg, cmap='jet')
         # plt.savefig("x.png")       
-        #############################
+        #############################   
+
+        # cluster_gts = cluster_gts * edge_seg_temp.unsqueeze(0)
+        # cluster_gts = cluster_gts * torch.e ** (edge_seg_temp.unsqueeze(0))
 
         cluster_gts = cluster_gts.argmax(dim=0)
+
+        # 好像vote之前结果还不错，vote之后结果就很不行了
         # vote
         for gt in range(db_label_set.shape[0]):
             mask_preds = patch_preds[cluster_gts==db_label_set[gt]] # n,
