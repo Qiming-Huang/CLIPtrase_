@@ -30,6 +30,12 @@ import clip_utils
 from configs.dataset_cfg import dataset_info, prompt_templates
 from configs.metric import scores
 
+from skimage import graph, segmentation
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
+from scipy.sparse import csgraph
+from collections import defaultdict
+
 device = "cuda"
 
 def _convert_image_to_rgb(image):
@@ -105,6 +111,144 @@ def get_visual_features(clip, images):
     # b,hw+1,512     12,b,hw+1,hw+1
     visual_features = visual_features/visual_features.norm(dim=-1, keepdim=True)
     return visual_features, attn_weights
+
+def build_color_rag(image, n_segments=500, compactness=10):
+    """
+    根据平均颜色构建 RAG（Region Adjacency Graph）
+    :param image: 输入图像，形状为 (H, W, 3)
+    :param n_segments: SLIC 超像素数量
+    :param compactness: SLIC 的紧致度参数
+    :return: RAG 图
+    """
+
+    labels = segmentation.slic(image, n_segments=n_segments, compactness=compactness, start_label=0)
+    rag = graph.rag_mean_color(image, labels)
+    
+    return rag, labels
+
+def build_rag_based_on_avg_color(image, patch_size=16):
+    """
+    根据平均颜色构建 RAG（Region Adjacency Graph）
+    :param image: 输入图像，形状为 (H, W, 3)，假设 H 和 W 可被 patch_size 整除
+    :param patch_size: 每个小块的大小
+    :return: RAG 图
+    """
+    H, W, _ = image.shape
+    num_patches_h = H // patch_size
+    num_patches_w = W // patch_size
+    
+    # 生成 labels，每个 16x16 小块一个标签
+    labels = np.zeros((H, W), dtype=np.int32)
+    label = 0
+    for i in range(0, H, patch_size):
+        for j in range(0, W, patch_size):
+            labels[i:i+patch_size, j:j+patch_size] = label
+            label += 1
+    
+    # 构建 RAG 图
+    rag = graph.rag_mean_color(image, labels)
+    
+    return rag, labels
+
+def build_feature_rag(vit_features, image_size=(224, 224), patch_size=16):
+    """
+    根据 ViT 提取的特征构建基于 Cosine Similarity 的 RAG，并返回 superpixel labels。
+    :param vit_features: ViT 提取的特征，形状为 (196, 512)
+    :param image_size: 输入图像的大小 (H, W)
+    :param patch_size: 每个 RAG 区域的大小
+    :return: RAG 图, superpixel labels
+    """
+    H, W = image_size
+    grid_size = H // patch_size  # 14x14 网格
+    
+    # 生成 superpixel labels
+    labels = np.arange(grid_size * grid_size).reshape((grid_size, grid_size))
+    
+    # 计算 Cosine Similarity 作为边权重
+    similarity_matrix = cosine_similarity(vit_features.detach().cpu().numpy())
+    
+    # 构建 RAG，格式与 skimage.graph.rag_mean_color 类似
+    rag = graph.RAG()
+    for i in range(grid_size * grid_size):
+        rag.add_node(i, feature=vit_features[i], labels=[i])
+    
+    for i in range(grid_size):
+        for j in range(grid_size):
+            node_id = i * grid_size + j
+            if j + 1 < grid_size:
+                right_id = node_id + 1
+                weight = 1 - similarity_matrix[node_id, right_id]  # Cosine 距离
+                rag.add_edge(node_id, right_id, weight=weight)
+            if i + 1 < grid_size:
+                bottom_id = node_id + grid_size
+                weight = 1 - similarity_matrix[node_id, bottom_id]  # Cosine 距离
+                rag.add_edge(node_id, bottom_id, weight=weight)
+    
+    return rag, labels
+
+def smooth_uncertainty_with_rag(uncertainty, rag, superpixel_labels, lambda_=0.5, iterations=10):
+    """
+    使用超像素 RAG 进行熵的拉普拉斯平滑。
+
+    参数：
+    - uncertainty: (H, W) 形状的不确定性熵
+    - rag: networkx Graph, 表示超像素区域邻接图
+    - superpixel_labels: (H, W) 形状，每个像素的超像素索引
+    - lambda_: 平滑系数 (0 < lambda_ < 1)
+    - iterations: 迭代次数，控制平滑程度
+
+    返回：
+    - smoothed_uncertainty: (H, W) 形状，平滑后的不确定性熵
+    """
+    unique_labels = np.unique(superpixel_labels)
+    num_superpixels = len(unique_labels)
+
+    # 计算每个超像素区域的初始均值熵
+    superpixel_uncertainty = np.zeros(num_superpixels)
+    for idx, label in enumerate(unique_labels):
+        mask = (superpixel_labels == label)
+        superpixel_uncertainty[idx] = uncertainty[mask].mean().item()  # 计算该超像素内的熵均值
+
+    # 获取 RAG 的邻接矩阵
+    L = nx.normalized_laplacian_matrix(rag).toarray()
+
+    # 迭代拉普拉斯平滑
+    for _ in range(iterations):
+        superpixel_uncertainty = (1 - lambda_) * superpixel_uncertainty + lambda_ * L @ superpixel_uncertainty
+
+    # 传播回像素级别
+    smoothed_uncertainty = np.zeros_like(uncertainty)
+    for idx, label in enumerate(unique_labels):
+        mask = (superpixel_labels == label)
+        smoothed_uncertainty[mask] = superpixel_uncertainty[idx]
+
+    return smoothed_uncertainty
+
+def adjust_posterior_with_entropy(P, H_opt, lambda_=1.0, epsilon=0.1):
+    """
+    根据调整后的熵 H_opt 重新调整类别后验概率 P。
+
+    参数：
+    - P: (C, H, W) 形状的类别后验概率
+    - H_opt: (H, W) 形状的熵
+    - lambda_: 控制熵对温度的影响
+    - epsilon: 防止温度过小的稳定项
+
+    返回：
+    - P_new: 重新调整后的后验概率 (C, H, W)
+    """
+    C, H, W = P.shape
+
+    # 计算温度 T(x, y) = λH_opt + ε
+    T = lambda_ * H_opt + epsilon  # 形状 (H, W)
+
+    # 计算指数调整后的概率 P_c^(1/T)
+    P_adj = P ** (1 / T[None, :, :])  # 广播到 (C, H, W)
+
+    # 归一化为概率分布
+    P_new = P_adj / np.sum(P_adj, axis=0, keepdims=True)
+
+    return P_new
 
 def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
     # text feature
@@ -198,6 +342,18 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
         cluster_gts = F.interpolate(
             cluster_gts.unsqueeze(0),size=(image_size,image_size),mode='bilinear',align_corners=False
         )[0] # n,H,W
+
+        # 基于熵的拉普拉斯平滑 后验预测概率
+        #############################
+        rag, superpixel_labels = build_color_rag(np.array(ori_images), n_segments=1000, compactness=10)
+        p_ = cluster_gts.softmax(dim=0)
+        uncertainty = -torch.sum(p_ * torch.log(p_), dim=0)
+
+        smoothed_uncertainty = smooth_uncertainty_with_rag(uncertainty.detach().cpu().numpy(), rag, superpixel_labels, lambda_=0.5, iterations=1)
+        cluster_gts = adjust_posterior_with_entropy(p_.detach().cpu().numpy(), smoothed_uncertainty)
+        cluster_gts = torch.as_tensor(cluster_gts).to("cuda")
+        #############################
+
         cluster_gts = cluster_gts.argmax(dim=0)
         # vote
         for gt in range(db_label_set.shape[0]):
@@ -226,12 +382,13 @@ def self_clip_test():
     clip_model, _ = clip_utils.load(clip_type, image_size=224) # origin transforms unused
     clip_model = clip_model.to(device)
     print('load clip success!')
-    datasets = ["VOC20","VOC21","COCO80_val","COCO171_val","PC59","PC60","PC459","ADE150","ADEfull"]
+    datasets = ["COCO171_val"]
+    # datasets = ["VOC20","VOC21","COCO80_val","COCO171_val","PC59","PC60","PC459","ADE150","ADEfull"]
     # datasets = ["VOC20","ADE150","ADEfull","COCO171_val","PC59", "PC459"]
     # datasets = ["VOC21", "COCO80_val", "PC60"]
     for d in datasets:
         self_clip(clip_model, d, image_size=224,eps=0.7,min=3)
-        self_clip(clip_model, d, image_size=336,eps=1.1,min=7)
+        # self_clip(clip_model, d, image_size=336,eps=1.1,min=7)
 
 if __name__=="__main__":
     with torch.no_grad():
