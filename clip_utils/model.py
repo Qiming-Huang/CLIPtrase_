@@ -184,6 +184,7 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor, self_qk_weight = False, self_out_weight = False):
+        # TODO 在计算QK^T的时候显示加入低频边缘信息先验
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         res,attn = self.attn(x, x, x, attn_mask=self.attn_mask,self_qk_weight=self_qk_weight, self_out_weight=self_out_weight)
         return res, attn
