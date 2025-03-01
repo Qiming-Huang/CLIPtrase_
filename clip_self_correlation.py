@@ -163,78 +163,182 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
         attn_weights = attn_weights-cls_weights
         attn_weights[attn_weights<0] = 0 # hw,hw
         # logits and preds
-        patch_logits = patch_tokens@text_features.T * clip.logit_scale.exp() # 196, C
-        patch_logits = patch_logits.permute(1,0).unsqueeze(0).reshape(1,text_features.shape[0],h,w)
-        patch_logits = F.interpolate(
-            patch_logits,size=(ori_h, ori_w),mode='bilinear',align_corners=False,
-        )[0] # C,H,W
+        ###################
+        superpixel_labels = segmentation.slic(np.array(ori_images), n_segments=1000, compactness=10, start_label=0)
+        rag = graph.rag_mean_color(np.array(ori_images), superpixel_labels)   
+
+        patch_tokens_ = F.interpolate(patch_tokens.permute(1,0).unsqueeze(0).reshape((1, 512, 14, 14)), (224, 224), mode='bilinear',align_corners=False).squeeze()
+        superpixel_tokens = []
+
+        for super_idx in np.unique(superpixel_labels):
+            mask = (superpixel_labels == super_idx)
+            superpixel_tokens.append(patch_tokens_[:, mask].mean(dim=-1))
+        superpixel_tokens = torch.stack(superpixel_tokens)
+
+        patch_logits = superpixel_tokens@text_features.T * clip.logit_scale.exp()
+        superpixel_labels_logits = patch_logits.argmax(dim=-1)
+        patch_preds = torch.zeros((224, 224))
+        
+        for super_idx in range(len(np.unique(superpixel_labels))):
+            mask = (superpixel_labels == super_idx)
+            patch_preds[mask] = superpixel_labels_logits[super_idx].float()
+        
+        atten_superpixel = superpixel_tokens @ superpixel_tokens.T
+
+        # dbscan = DBSCAN(eps=eps, min_samples=min, metric='precomputed')
+        # labels_super = dbscan.fit_predict(atten_superpixel[:200,:200].detach().cpu().numpy())
+        
+        dbscan = KMeans(n_clusters=7, n_init=10)
+        labels_ = dbscan.fit_predict(atten_superpixel.detach().cpu().numpy())
+
+        patch_preds_ = torch.zeros((224, 224))
+        
+        for super_idx in range(len(np.unique(superpixel_labels))):
+            mask = (superpixel_labels == super_idx)
+            patch_preds_[mask] = labels_[super_idx]
+
+        # voting
+        # patch_preds_final = torch.zeros((224, 224))
+        # for idx in np.unique(patch_preds_):
+        #     mask = (patch_preds_ == idx)
+        #     mask_preds = patch_preds[mask]
+
+        #     unique_val, counts = torch.unique(mask_preds, return_counts = True)
+        #     if counts.shape[0]==0:
+        #         continue
+        #     patch_preds_final[mask] = unique_val[counts.argmax()]
+            # pred_label = cluster_preds[gt]            
+
+
+        # region_pred_lists = []
+        # for idx in np.unique(labels_):
+        #     mask = (labels_ == labels_[idx])
+        #     region_feat = superpixel_tokens[mask]
+        #     region_preds = (region_feat@text_features.T * clip.logit_scale.exp()).argmax(dim=-1)
+        #     unique_val, counts = torch.unique(region_preds, return_counts = True) 
+        #     region_pred_lists.append(unique_val[counts.argmax()])
+
+        # patch_preds_final = torch.zeros((224, 224))
+        # for idx in np.unique(labels_):
+        #     mask = (patch_preds_ == idx)
+        #     patch_preds_final[mask] = region_pred_lists[idx].float()
+        
+        print("a")
+
+        # cluster_gts = []
+        # db_label_set = np.unique(labels_)
+        # for l in range(db_label_set.shape[0]):
+        #     # TODO得转换 labels_==db_label_set[l] 到 196中
+        #     temp_attn = attn_weights[labels_==db_label_set[l]] # n,l
+        #     temp_attn = temp_attn.mean(dim=0)
+        #     cluster_gts.append(temp_attn)
+        # cluster_gts = torch.stack(cluster_gts,dim=0) # n,l
+        # cluster_gts = cluster_gts.reshape(cluster_gts.shape[0],h,w) # n,h,w
+
+        # feature  
+
+        # cluster_gts = []
+        # for l in range(db_label_set.shape[0]):
+        #     temp_attn = attn_weights[labels==db_label_set[l]] # n,l
+        #     temp_attn = temp_attn.mean(dim=0)
+        #     cluster_gts.append(temp_attn)
+        # cluster_gts = torch.stack(cluster_gts,dim=0) # n,l
+        # cluster_gts = cluster_gts.reshape(cluster_gts.shape[0],h,w) # n,h,w        
+
+        # patch_preds_final = torch.zeros((224, 224))
+        # for idx in torch.unique(patch_preds_):
+        #     mask = (patch_preds_ == idx)
+        #     mask_preds = patch_preds_[patch_preds_ == idx]
+        #     unique_val, counts = torch.unique(mask_preds, return_counts = True) 
+
+        #     pred_label = unique_val[counts.argmax()]    
+            
+        #     patch_preds_final[mask] = pred_label
+               
+
+        # vote   
+        # db_label_set = torch.unique(torch.from_numpy(labels_))
+        # for gt in range(db_label_set.shape[0]):
+        #     mask_preds = patch_preds[patch_preds_==db_label_set[gt]] # n,
+        #     unique_val, counts = torch.unique(mask_preds, return_counts = True)
+        #     if counts.shape[0]==0:
+        #         continue
+        #     pred_label = unique_val[counts.argmax()]
+        #     # pred_label = cluster_preds[gt]
+        #     patch_preds[patch_preds_==db_label_set[gt]] = pred_label    
+        ###################
+
+        # patch_logits = patch_tokens@text_features.T * clip.logit_scale.exp() # 196, C
+        # patch_logits = patch_logits.permute(1,0).unsqueeze(0).reshape(1,text_features.shape[0],h,w)
+        # patch_logits = F.interpolate(
+        #     patch_logits,size=(ori_h, ori_w),mode='bilinear',align_corners=False,
+        # )[0] # C,H,W
         if dataset=='VOC20':
             cls_logits = cls_token@text_features.T * clip.logit_scale.exp() # 1,c
             patch_logits = patch_logits*cls_logits[0].unsqueeze(1).unsqueeze(1)
         
         # super-pixel argmax operator
         ############################
-        superpixel_labels = segmentation.slic(np.array(ori_images), n_segments=1000, compactness=10, start_label=0)
-        rag = graph.rag_mean_color(np.array(ori_images), superpixel_labels)
+        # superpixel_labels = segmentation.slic(np.array(ori_images), n_segments=1000, compactness=10, start_label=0)
+        # rag = graph.rag_mean_color(np.array(ori_images), superpixel_labels)
 
-        patch_logits_copy = deepcopy(patch_logits)
-        for idx_super in np.unique(superpixel_labels):
-            mask = (superpixel_labels == idx_super)
-            # patch_logits_copy[:, mask] = patch_logits[:, mask].mean(dim=-1).unsqueeze(dim=-1)
-
-            patch_logits_copy[:, mask] = torch.max(patch_logits[:, mask], dim=-1).values.unsqueeze(dim=-1)
-        patch_preds = patch_logits_copy.argmax(dim=0) # H,W
+        # patch_logits_copy = deepcopy(patch_logits)
+        # for idx_super in np.unique(superpixel_labels):
+        #     mask = (superpixel_labels == idx_super)
+        #     patch_logits_copy[:, mask] = patch_logits[:, mask].mean(dim=-1).unsqueeze(dim=-1)
+        #     # patch_logits_copy[:, mask] = torch.max(patch_logits[:, mask], dim=-1).values.unsqueeze(dim=-1)
+        # patch_preds = patch_logits_copy.argmax(dim=0) # H,W
         ############################
         
-        # patch_preds = patch_logits.argmax(dim=0) # H,W
+        patch_preds = patch_logits.argmax(dim=0) # H,W
 
         if with_bg:
             patch_preds[patch_preds>=C] = C
             gts[gts==255] = C
-        # clusters
-        dbscan = DBSCAN(eps=eps, min_samples=min)
-        labels = dbscan.fit_predict(attn_weights.detach().cpu().numpy())
-        labels = torch.from_numpy(labels).to(device)
-        db_label_set = torch.unique(labels)
-        if db_label_set.shape[0]==1 and db_label_set[0]==-1:
-            # no clusters, continue
-            cal_pred.append(patch_preds.cpu().numpy())
-            cal_gt.append(gts.cpu().numpy())
-            # print('no clusters!')
-            continue
-        if db_label_set[0]==-1:
-            db_label_set = db_label_set[1:]
-        # clusters post process
-        cluster_gts = []
-        for l in range(db_label_set.shape[0]):
-            temp_attn = attn_weights[labels==db_label_set[l]] # n,l
-            temp_attn = temp_attn.mean(dim=0)
-            cluster_gts.append(temp_attn)
-        cluster_gts = torch.stack(cluster_gts,dim=0) # n,l
-        cluster_gts = cluster_gts.reshape(cluster_gts.shape[0],h,w) # n,h,w
-        # smooth
-        ratio = 4
-        cluster_gts = F.interpolate(
-            cluster_gts.unsqueeze(0),size=(ratio*h,ratio*w),mode='bilinear',align_corners=False
-        )[0] # n,224,224
-        cluster_gts = cluster_gts.detach().cpu().numpy()
-        for i in range(cluster_gts.shape[0]):
-            cluster_gts[i] = median_filter(cluster_gts[i],size=ratio*2-1)
-        cluster_gts = torch.from_numpy(cluster_gts)
-        cluster_gts = cluster_gts.to(device)
-        cluster_gts = F.interpolate(
-            cluster_gts.unsqueeze(0),size=(image_size,image_size),mode='bilinear',align_corners=False
-        )[0] # n,H,W
-        cluster_gts = cluster_gts.argmax(dim=0)
-        # vote
-        for gt in range(db_label_set.shape[0]):
-            mask_preds = patch_preds[cluster_gts==db_label_set[gt]] # n,
-            unique_val, counts = torch.unique(mask_preds, return_counts = True)
-            if counts.shape[0]==0:
-                continue
-            pred_label = unique_val[counts.argmax()]
-            # pred_label = cluster_preds[gt]
-            patch_preds[cluster_gts==db_label_set[gt]] = pred_label
+        # # clusters
+        # dbscan = DBSCAN(eps=eps, min_samples=min)
+        # labels = dbscan.fit_predict(attn_weights.detach().cpu().numpy())
+        # labels = torch.from_numpy(labels).to(device)
+        # db_label_set = torch.unique(labels)
+        # if db_label_set.shape[0]==1 and db_label_set[0]==-1:
+        #     # no clusters, continue
+        #     cal_pred.append(patch_preds.cpu().numpy())
+        #     cal_gt.append(gts.cpu().numpy())
+        #     # print('no clusters!')
+        #     continue
+        # if db_label_set[0]==-1:
+        #     db_label_set = db_label_set[1:]
+        # # clusters post process
+        # cluster_gts = []
+        # for l in range(db_label_set.shape[0]):
+        #     temp_attn = attn_weights[labels==db_label_set[l]] # n,l
+        #     temp_attn = temp_attn.mean(dim=0)
+        #     cluster_gts.append(temp_attn)
+        # cluster_gts = torch.stack(cluster_gts,dim=0) # n,l
+        # cluster_gts = cluster_gts.reshape(cluster_gts.shape[0],h,w) # n,h,w
+        # # smooth
+        # ratio = 4
+        # cluster_gts = F.interpolate(
+        #     cluster_gts.unsqueeze(0),size=(ratio*h,ratio*w),mode='bilinear',align_corners=False
+        # )[0] # n,224,224
+        # cluster_gts = cluster_gts.detach().cpu().numpy()
+        # for i in range(cluster_gts.shape[0]):
+        #     cluster_gts[i] = median_filter(cluster_gts[i],size=ratio*2-1)
+        # cluster_gts = torch.from_numpy(cluster_gts)
+        # cluster_gts = cluster_gts.to(device)
+        # cluster_gts = F.interpolate(
+        #     cluster_gts.unsqueeze(0),size=(image_size,image_size),mode='bilinear',align_corners=False
+        # )[0] # n,H,W
+        # cluster_gts = cluster_gts.argmax(dim=0)
+        # # vote
+        # for gt in range(db_label_set.shape[0]):
+        #     mask_preds = patch_preds[cluster_gts==db_label_set[gt]] # n,
+        #     unique_val, counts = torch.unique(mask_preds, return_counts = True)
+        #     if counts.shape[0]==0:
+        #         continue
+        #     pred_label = unique_val[counts.argmax()]
+        #     # pred_label = cluster_preds[gt]
+        #     patch_preds[cluster_gts==db_label_set[gt]] = pred_label
 
         if with_bg:
             patch_preds[patch_preds>=C] = C
