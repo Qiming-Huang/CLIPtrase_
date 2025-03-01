@@ -30,6 +30,18 @@ import clip_utils
 from configs.dataset_cfg import dataset_info, prompt_templates
 from configs.metric import scores
 
+from skimage import graph, segmentation
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
+from scipy.sparse import csgraph
+from collections import defaultdict
+import seaborn as sns
+from sklearn.cluster import KMeans
+from collections import Counter
+from scipy.stats import mode
+
+from copy import deepcopy
+
 device = "cuda"
 
 def _convert_image_to_rgb(image):
@@ -159,7 +171,22 @@ def self_clip(clip, dataset, image_size=224,eps=0.7,min=3):
         if dataset=='VOC20':
             cls_logits = cls_token@text_features.T * clip.logit_scale.exp() # 1,c
             patch_logits = patch_logits*cls_logits[0].unsqueeze(1).unsqueeze(1)
-        patch_preds = patch_logits.argmax(dim=0) # H,W
+        
+        # super-pixel argmax operator
+        ############################
+        superpixel_labels = segmentation.slic(np.array(ori_images), n_segments=1000, compactness=10, start_label=0)
+        rag = graph.rag_mean_color(np.array(ori_images), superpixel_labels)
+
+        patch_logits_copy = deepcopy(patch_logits)
+        for idx_super in np.unique(superpixel_labels):
+            mask = (superpixel_labels == idx_super)
+            # patch_logits_copy[:, mask] = patch_logits[:, mask].mean(dim=-1).unsqueeze(dim=-1)
+
+            patch_logits_copy[:, mask] = torch.max(patch_logits[:, mask], dim=-1).values.unsqueeze(dim=-1)
+        patch_preds = patch_logits_copy.argmax(dim=0) # H,W
+        ############################
+        
+        # patch_preds = patch_logits.argmax(dim=0) # H,W
 
         if with_bg:
             patch_preds[patch_preds>=C] = C
@@ -226,12 +253,13 @@ def self_clip_test():
     clip_model, _ = clip_utils.load(clip_type, image_size=224) # origin transforms unused
     clip_model = clip_model.to(device)
     print('load clip success!')
-    datasets = ["VOC20","VOC21","COCO80_val","COCO171_val","PC59","PC60","PC459","ADE150","ADEfull"]
+    # datasets = ["VOC20","VOC21","COCO80_val","COCO171_val","PC59","PC60","PC459","ADE150","ADEfull"]
     # datasets = ["VOC20","ADE150","ADEfull","COCO171_val","PC59", "PC459"]
     # datasets = ["VOC21", "COCO80_val", "PC60"]
+    datasets = ["COCO171_val"]
     for d in datasets:
         self_clip(clip_model, d, image_size=224,eps=0.7,min=3)
-        self_clip(clip_model, d, image_size=336,eps=1.1,min=7)
+        # self_clip(clip_model, d, image_size=336,eps=1.1,min=7)
 
 if __name__=="__main__":
     with torch.no_grad():
